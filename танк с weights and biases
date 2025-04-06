@@ -1,0 +1,454 @@
+# -*- coding: utf-8 -*-
+import pygame
+import sys
+import math
+import random
+import numpy as np
+import os
+import time
+from typing import Optional, Union
+
+import gymnasium as gym
+from gymnasium import spaces
+
+# Импорты Stable Baselines3
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+
+# Импорты для рендеринга в Colab
+try:
+    from pyvirtualdisplay import Display
+    from PIL import Image
+    from IPython import display as ipythondisplay
+    colab_render_enabled = True
+except ImportError:
+    print("Не удалось импортировать библиотеки для рендеринга в Colab. Визуализация будет недоступна.")
+    colab_render_enabled = False
+
+# --- ИМПОРТ Weights & Biases ---
+try:
+    import wandb
+    from wandb.integration.sb3 import WandbCallback
+    wandb_enabled = True
+except ImportError:
+    print("Не удалось импортировать wandb. Логирование в Weights & Biases будет отключено.")
+    print("Установите: pip install wandb")
+    wandb_enabled = False
+    WandbCallback = None # Заглушка, если wandb не установлен
+
+# --- Константы Игры (Без изменений) ---
+SCREEN_WIDTH = 400
+SCREEN_HEIGHT = 300
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+GREEN = (0, 255, 0)
+RED = (255, 0, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+TANK_WIDTH = 20
+TANK_HEIGHT = 25
+TANK_SPEED = 4
+ENEMY_SPEED = 2.5
+PROJECTILE_SPEED = TANK_SPEED * 2
+PROJECTILE_RADIUS = 3
+FPS = 30
+ENEMY_CHANGE_DIR_INTERVAL_STEPS = 50
+ENEMY_SHOOT_INTERVAL_STEPS = 120
+MAX_PLAYER_PROJECTILES = 8
+MAX_ENEMY_PROJECTILES = 10
+MAX_ENEMIES = 3
+
+# --- Игровые Классы (Без изменений) ---
+class BaseTank(pygame.sprite.Sprite):
+    def __init__(self, x, y, color, speed, img_width=TANK_WIDTH, img_height=TANK_HEIGHT):
+        super().__init__()
+        self.img_width = img_width
+        self.img_height = img_height
+        self.original_image = pygame.Surface([img_width, img_height], pygame.SRCALPHA)
+        core_width, core_height = img_width * 0.8, img_height * 0.7
+        core_x, core_y = (img_width - core_width) / 2, img_height * 0.2
+        pygame.draw.rect(self.original_image, color, (core_x, core_y, core_width, core_height), border_radius=3)
+        barrel_width, barrel_height = img_width * 0.15, img_height * 0.5
+        barrel_x, barrel_y = (img_width - barrel_width) / 2, 0
+        pygame.draw.rect(self.original_image, (100, 100, 100), (barrel_x, barrel_y, barrel_width, barrel_height))
+        self.image = self.original_image
+        self.rect = self.image.get_rect(center=(x, y))
+        self.speed = speed
+        self.x, self.y = float(self.rect.centerx), float(self.rect.centery)
+        self.direction_vector = pygame.math.Vector2(0, -1)
+        self.angle = 0
+        self.rotate()
+
+    def update(self, move_vector: Optional[pygame.math.Vector2] = None):
+        if not self.alive(): return
+        if move_vector and move_vector.length_squared() > 0:
+             norm_move_vec = move_vector.normalize()
+             if norm_move_vec != self.direction_vector:
+                 self.direction_vector = norm_move_vec
+                 self.rotate()
+             self.x += self.direction_vector.x * self.speed
+             self.y += self.direction_vector.y * self.speed
+             self.apply_bounds()
+             self.rect.center = (int(self.x), int(self.y))
+
+    def rotate(self):
+        self.angle = math.degrees(math.atan2(-self.direction_vector.y, self.direction_vector.x)) - 90
+        old_center = self.rect.center
+        self.image = pygame.transform.rotate(self.original_image, self.angle)
+        self.rect = self.image.get_rect(center=old_center)
+
+    def apply_bounds(self):
+        half_w, half_h = self.rect.width / 2, self.rect.height / 2
+        self.x = max(half_w, min(self.x, SCREEN_WIDTH - half_w))
+        self.y = max(half_h, min(self.y, SCREEN_HEIGHT - half_h))
+
+    def shoot(self, projectile_color):
+        offset_distance = self.img_height / 2
+        spawn_pos = pygame.math.Vector2(self.rect.center) + self.direction_vector * offset_distance
+        return Projectile(spawn_pos.x, spawn_pos.y, self.direction_vector.copy(), projectile_color)
+
+class PlayerTank(BaseTank):
+    def __init__(self, x, y):
+        super().__init__(x, y, GREEN, TANK_SPEED)
+    def update(self, action: int):
+        if not self.alive(): return False
+        move_vector = pygame.math.Vector2(0, 0)
+        shooting = False
+        if action == 0: move_vector.y = -1
+        elif action == 1: move_vector.y = 1
+        elif action == 2: move_vector.x = -1
+        elif action == 3: move_vector.x = 1
+        elif action == 4: shooting = True
+        super().update(move_vector=move_vector)
+        return shooting
+
+class EnemyTank(BaseTank):
+    def __init__(self, x, y, change_dir_interval, shoot_interval):
+        super().__init__(x, y, BLUE, ENEMY_SPEED)
+        self.change_dir_interval = change_dir_interval
+        self.shoot_interval = shoot_interval
+        self.move_timer = random.randint(1, self.change_dir_interval)
+        self.shoot_timer = random.randint(1, self.shoot_interval)
+        self.wants_to_shoot = False
+    def update(self, *args):
+        if not self.alive(): return
+        self.move_timer -= 1
+        if self.move_timer <= 0:
+            self.direction_vector = random.choice([pygame.math.Vector2(0,1), pygame.math.Vector2(0,-1), pygame.math.Vector2(1,0), pygame.math.Vector2(-1,0)])
+            self.rotate()
+            self.move_timer = self.change_dir_interval + random.randint(-self.change_dir_interval//4, self.change_dir_interval//4)
+        super().update(move_vector=self.direction_vector)
+        self.shoot_timer -= 1
+        self.wants_to_shoot = False
+        if self.shoot_timer <= 0:
+            self.wants_to_shoot = True
+            self.shoot_timer = self.shoot_interval + random.randint(-self.shoot_interval//2, self.shoot_interval//2)
+
+class Projectile(pygame.sprite.Sprite):
+    def __init__(self, x, y, direction_vector, color):
+        super().__init__()
+        self.image = pygame.Surface([PROJECTILE_RADIUS * 2, PROJECTILE_RADIUS * 2], pygame.SRCALPHA)
+        pygame.draw.circle(self.image, color, (PROJECTILE_RADIUS, PROJECTILE_RADIUS), PROJECTILE_RADIUS)
+        self.rect = self.image.get_rect(center=(x, y))
+        self.speed = PROJECTILE_SPEED
+        if direction_vector.length_squared() > 0: self.direction_vector = direction_vector.normalize()
+        else: self.direction_vector = pygame.math.Vector2(0, -1)
+        self.x, self.y = float(self.rect.centerx), float(self.rect.centery)
+    def update(self, *args):
+        move_vec = self.direction_vector * self.speed
+        self.x += move_vec.x; self.y += move_vec.y
+        self.rect.center = (int(self.x), int(self.y))
+        if not (0 <= self.rect.centerx <= SCREEN_WIDTH and 0 <= self.rect.centery <= SCREEN_HEIGHT):
+            self.kill()
+
+# --- Gymnasium Среда (Без изменений) ---
+class TankEnv(gym.Env):
+    metadata = {"render_modes": ["rgb_array", "human"], "render_fps": FPS}
+    def __init__(self, render_mode: Optional[str] = None):
+        super().__init__()
+        self.render_mode = render_mode
+        self.screen: Optional[pygame.Surface] = None
+        self.clock: Optional[pygame.time.Clock] = None
+        self.is_pygame_init = False
+        self._ensure_pygame_init()
+        if self.render_mode == "human":
+            try:
+                pygame.display.set_caption("Tank RL Environment")
+                self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                self.clock = pygame.time.Clock()
+            except pygame.error as e:
+                print(f"Pygame display error: {e}. Switching render_mode to None.")
+                self.render_mode = None; self.screen = None; self.clock = None
+        elif self.render_mode == "rgb_array":
+             self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.action_space = spaces.Discrete(6)
+        obs_size = 2 + MAX_ENEMIES * 3 + MAX_PLAYER_PROJECTILES * 2 + MAX_ENEMY_PROJECTILES * 2
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_size,), dtype=np.float32)
+        self.enemy_change_dir_interval = ENEMY_CHANGE_DIR_INTERVAL_STEPS
+        self.enemy_shoot_interval = ENEMY_SHOOT_INTERVAL_STEPS
+        self.player_tank: Optional[PlayerTank] = None
+        self.enemy_tanks = pygame.sprite.Group()
+        self.player_projectiles = pygame.sprite.Group()
+        self.enemy_projectiles = pygame.sprite.Group()
+        self.all_sprites = pygame.sprite.Group()
+        self.game_over = False; self.win = False; self._enemy_list = []
+    def _ensure_pygame_init(self):
+         if not self.is_pygame_init:
+              pygame.init(); pygame.font.init(); self.is_pygame_init = True
+    def _get_obs(self) -> np.ndarray:
+        obs = np.full(self.observation_space.shape, -1.0, dtype=np.float32)
+        if self.player_tank and self.player_tank.alive():
+            obs[0]=np.clip(self.player_tank.x/SCREEN_WIDTH*2-1,-1,1); obs[1]=np.clip(self.player_tank.y/SCREEN_HEIGHT*2-1,-1,1)
+        idx=2
+        for i in range(MAX_ENEMIES):
+            alive=False
+            if i<len(self._enemy_list) and self._enemy_list[i].alive():
+                e=self._enemy_list[i]; obs[idx]=np.clip(e.x/SCREEN_WIDTH*2-1,-1,1); obs[idx+1]=np.clip(e.y/SCREEN_HEIGHT*2-1,-1,1); alive=True
+            obs[idx+2]=1.0 if alive else 0.0; idx+=3
+        p_start=idx
+        for i,p in enumerate(self.player_projectiles):
+            if i>=MAX_PLAYER_PROJECTILES: break
+            ci=p_start+i*2; obs[ci]=np.clip(p.x/SCREEN_WIDTH*2-1,-1,1); obs[ci+1]=np.clip(p.y/SCREEN_HEIGHT*2-1,-1,1)
+        e_start=2+MAX_ENEMIES*3+MAX_PLAYER_PROJECTILES*2
+        for i,p in enumerate(self.enemy_projectiles):
+            if i>=MAX_ENEMY_PROJECTILES: break
+            ci=e_start+i*2; obs[ci]=np.clip(p.x/SCREEN_WIDTH*2-1,-1,1); obs[ci+1]=np.clip(p.y/SCREEN_HEIGHT*2-1,-1,1)
+        return obs.astype(np.float32)
+    def _get_info(self) -> dict:
+         p_alive = self.player_tank.alive() if self.player_tank else False
+         return {"player_alive": p_alive, "enemies_left": len(self.enemy_tanks), "player_projectiles": len(self.player_projectiles),
+                 "enemy_projectiles": len(self.enemy_projectiles), "win": self.win}
+    def reset(self, seed: Optional[int]=None, options: Optional[dict]=None)->tuple[np.ndarray,dict]:
+        super().reset(seed=seed); self._ensure_pygame_init(); self.game_over=False; self.win=False
+        self.all_sprites.empty(); self.enemy_tanks.empty(); self.player_projectiles.empty(); self.enemy_projectiles.empty(); self._enemy_list=[]
+        self.player_tank = PlayerTank(SCREEN_WIDTH//2, SCREEN_HEIGHT - TANK_HEIGHT*1.5); self.all_sprites.add(self.player_tank)
+        for i in range(MAX_ENEMIES):
+            ex=(i+1)*SCREEN_WIDTH//(MAX_ENEMIES+1); ey=TANK_HEIGHT; e=EnemyTank(ex,ey,self.enemy_change_dir_interval,self.enemy_shoot_interval)
+            self.all_sprites.add(e); self.enemy_tanks.add(e); self._enemy_list.append(e)
+        return self._get_obs(), self._get_info()
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
+        if self.game_over: return self._get_obs(), 0.0, True, False, self._get_info()
+        self._ensure_pygame_init(); reward = 0.0; terminated = False; truncated = False
+        p_shoot = False; p_alive_before = self.player_tank.alive()
+        if p_alive_before:
+            p_shoot = self.player_tank.update(action)
+            if p_shoot and len(self.player_projectiles) < MAX_PLAYER_PROJECTILES:
+                proj=self.player_tank.shoot(RED); self.all_sprites.add(proj); self.player_projectiles.add(proj); reward-=0.02
+        for e in self.enemy_tanks:
+            e.update()
+            if e.wants_to_shoot and len(self.enemy_projectiles) < MAX_ENEMY_PROJECTILES:
+                proj=e.shoot(YELLOW); self.all_sprites.add(proj); self.enemy_projectiles.add(proj)
+        self.player_projectiles.update(); self.enemy_projectiles.update()
+        enemies_hit=pygame.sprite.groupcollide(self.enemy_tanks, self.player_projectiles, True, True)
+        if enemies_hit:
+            reward += 15.0 * len(enemies_hit)
+            if len(self.enemy_tanks) == 0 and p_alive_before:
+                self.win=True; self.game_over=True; terminated=True; reward+=100.0
+        if p_alive_before and not self.game_over:
+             player_hits=pygame.sprite.spritecollide(self.player_tank, self.enemy_projectiles, True)
+             if player_hits:
+                 reward-=50.0; self.player_tank.kill(); self.game_over=True; terminated=True; self.win=False
+        reward -= 0.01
+        obs = self._get_obs(); info = self._get_info()
+        if self.render_mode == "human": self._render_frame()
+        return obs, reward, terminated, truncated, info
+    def render(self) -> Optional[np.ndarray]:
+        if self.render_mode == "rgb_array": return self._render_frame()
+        return None
+    def _render_frame(self) -> Optional[np.ndarray]:
+        if self.screen is None and self.render_mode is not None:
+             if self.render_mode == "human":
+                 try: self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                 except pygame.error: self.render_mode=None; return None
+             elif self.render_mode == "rgb_array": self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        if self.screen is None: return None
+        self.screen.fill(BLACK); self.all_sprites.draw(self.screen)
+        if self.render_mode=="human" and self.game_over:
+             try:
+                 font=pygame.font.Font(None, 48); msg="ПОБЕДА!" if self.win else "ПОРАЖЕНИЕ!"; color=GREEN if self.win else RED
+                 ts=font.render(msg, True, color); tr=ts.get_rect(center=(SCREEN_WIDTH/2, SCREEN_HEIGHT/2)); self.screen.blit(ts, tr)
+             except pygame.error as e: print(f"Text render error: {e}")
+        if self.render_mode == "human":
+             if pygame.display.get_init(): pygame.event.pump(); pygame.display.flip()
+             if self.clock: self.clock.tick(self.metadata["render_fps"])
+             return None
+        elif self.render_mode == "rgb_array":
+             try: return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)),axes=(1,0,2)).astype(np.uint8)
+             except pygame.error as e: print(f"Surfarray error: {e}"); return None
+    def close(self):
+        if self.is_pygame_init:
+            if pygame.display.get_init(): pygame.display.quit()
+            if pygame.font.get_init(): pygame.font.quit()
+            pygame.quit(); self.is_pygame_init = False
+        self.screen = None
+
+# --- Обучение и Оценка в Colab с WandB ---
+if __name__ == '__main__':
+
+    # --- КОНФИГУРАЦИЯ WANDB и ОБУЧЕНИЯ ---
+    TOTAL_TIMESTEPS = 50000 # Увеличим немного шаги для демонстрации графиков
+    WANDB_PROJECT_NAME = "TankEnv_PPO_Colab" # Название проекта в WandB
+    # Гиперпараметры для логирования
+    config = {
+        "policy_type": "MlpPolicy",
+        "total_timesteps": TOTAL_TIMESTEPS,
+        "env_id": "TankEnv-v0", # Условный ID среды
+        "tank_speed": TANK_SPEED,
+        "enemy_speed": ENEMY_SPEED,
+        "projectile_speed": PROJECTILE_SPEED,
+        "max_enemies": MAX_ENEMIES,
+        "max_player_proj": MAX_PLAYER_PROJECTILES,
+        "max_enemy_proj": MAX_ENEMY_PROJECTILES,
+        "reward_hit_enemy": 15.0,
+        "reward_win": 100.0,
+        "penalty_hit_player": -50.0,
+        "penalty_shoot": -0.02,
+        "penalty_step": -0.01,
+    }
+
+    vdisplay: Optional[Display] = None
+    if colab_render_enabled:
+        print("Настройка виртуального дисплея...")
+        try: vdisplay = Display(visible=0, size=(SCREEN_WIDTH, SCREEN_HEIGHT))
+        except Exception as e: print(f"Ошибка vdisplay: {e}")
+        if vdisplay: vdisplay.start(); print("Виртуальный дисплей запущен.")
+    else: print("Визуализация в Colab недоступна.")
+
+    log_dir = f"logs/{WANDB_PROJECT_NAME}/"
+    model_dir = f"models/{WANDB_PROJECT_NAME}/"
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Инициализируем WandB Run
+    run = None
+    if wandb_enabled:
+        try:
+            run = wandb.init(
+                project=WANDB_PROJECT_NAME,
+                config=config, # Логируем гиперпараметры
+                sync_tensorboard=True,  # Автоматически синхронизировать с логами SB3/TensorBoard
+                monitor_gym=True,       # Автоматически логировать видео (если среда поддерживает) - не будет работать с нашим рендерингом
+                save_code=True,         # Сохранить код скрипта в WandB
+            )
+            print(f"WandB run инициализирован: {run.get_url()}")
+        except Exception as e:
+            print(f"Ошибка инициализации WandB: {e}. Логирование будет отключено.")
+            wandb_enabled = False # Отключаем если инициализация не удалась
+
+    # Переменная для коллбэка
+    callback_list = []
+    if wandb_enabled and run is not None:
+        # Создаем WandbCallback
+        wandb_callback = WandbCallback(
+            # gradient_save_freq=1000, # Можно включить для отладки градиентов
+            model_save_path=os.path.join(model_dir, f"wandb_models/{run.id}"), # Путь для сохранения моделей через WandB
+            model_save_freq=5000, # Как часто сохранять модель в WandB (в шагах)
+            log="all", # Логировать все доступные метрики
+            verbose=0 # Уменьшим verbose коллбэка, т.к. есть verbose=1 у PPO
+        )
+        callback_list.append(wandb_callback)
+
+    # Обучение оборачиваем в try...finally для гарантированного завершения run
+    try:
+        print("\n--- Обучение ---")
+        # 1. Создаем базовую среду
+        train_base_env = TankEnv(render_mode=None)
+        # 2. Оборачиваем в Monitor (необходимо для rollout/ метрик!)
+        monitor_path = os.path.join(log_dir, f"monitor_{run.id if run else 'local'}.csv")
+        train_monitored_env = Monitor(train_base_env, filename=monitor_path)
+        # 3. Оборачиваем в DummyVecEnv
+        train_env = DummyVecEnv([lambda: train_monitored_env])
+
+        # Определяем модель PPO
+        model = PPO(config["policy_type"],
+                    train_env,
+                    verbose=1,
+                    tensorboard_log=log_dir, # SB3 все еще создает логи TB, WandB их читает
+                    # Можно передать гиперпараметры из config для воспроизводимости
+                    learning_rate=config.get("learning_rate", 0.0003), # Пример
+                    n_steps=config.get("n_steps", 2048),
+                    batch_size=config.get("batch_size", 64),
+                    n_epochs=config.get("n_epochs", 10),
+                    gamma=config.get("gamma", 0.99),
+                    # ... другие параметры PPO
+                    )
+
+        MODEL_SAVE_NAME = f"ppo_tank_{TOTAL_TIMESTEPS}_steps_{run.id if run else 'local'}"
+
+        print(f"Начинаем обучение на {TOTAL_TIMESTEPS} шагов (Логи в WandB и TensorBoard)...")
+        # Передаем список коллбэков
+        model.learn(total_timesteps=TOTAL_TIMESTEPS,
+                    reset_num_timesteps=True,
+                    tb_log_name="PPO_Colab",
+                    callback=callback_list if callback_list else None) # Передаем коллбэк
+        print("Обучение завершено.")
+
+        # Сохраняем финальную модель
+        model_path = os.path.join(model_dir, MODEL_SAVE_NAME)
+        model.save(model_path)
+        print(f"Финальная модель сохранена в: {model_path}")
+
+        # Закрываем среду обучения
+        train_env.close()
+        print("Среда обучения закрыта.")
+
+        # --- Оценка (оставляем как есть, но без wandb логирования) ---
+        print("\n--- Оценка обученной модели ---")
+        eval_env = TankEnv(render_mode="rgb_array")
+        img_display_handle = None
+
+        try:
+            # Загружаем модель по последнему пути
+            loaded_model = PPO.load(model_path, env=eval_env)
+            episodes = 2
+            max_steps_per_episode = 500
+
+            for ep in range(episodes):
+                obs, info = eval_env.reset()
+                terminated = False; truncated = False; ep_reward = 0; ep_steps = 0
+                img_display_handle = None
+                print(f"\nНачало эпизода оценки {ep+1}")
+                while not terminated and not truncated:
+                    action, _ = loaded_model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = eval_env.step(action)
+                    ep_reward += reward; ep_steps += 1
+                    if colab_render_enabled:
+                        try:
+                            frame = eval_env.render()
+                            if frame is not None:
+                                pil_image = Image.fromarray(frame)
+                                if img_display_handle is None:
+                                    img_display_handle = ipythondisplay.display(pil_image, display_id=f"tank-eval-{ep}-{time.time()}")
+                                else: img_display_handle.update(pil_image)
+                                time.sleep(max(0, 1.0 / FPS - 0.01))
+                            else:
+                                if img_display_handle: print("Warning: render() вернул None"); img_display_handle = None
+                        except Exception as e: print(f"Ошибка рендеринга/отображения: {e}")
+                    if ep_steps >= max_steps_per_episode: truncated = True
+                result_str='Усечено'; win_info=info.get('win',False)
+                if win_info: result_str='Победа'
+                elif terminated: result_str='Поражение'
+                print(f"Конец эпизода оценки {ep+1}: Шагов={ep_steps}, Награда={ep_reward:.2f}, Результат: {result_str}")
+                if colab_render_enabled: time.sleep(0.5)
+
+        except FileNotFoundError: print(f"Ошибка: Не удалось загрузить модель из {model_path}.")
+        except Exception as e: print(f"Произошла ошибка во время оценки: {e}"); import traceback; traceback.print_exc()
+        finally: eval_env.close(); print("Среда оценки закрыта.")
+
+    finally:
+        # --- Гарантированное завершение WandB и VDisplay ---
+        if wandb_enabled and run is not None:
+            try:
+                run.finish()
+                print("WandB run завершен.")
+            except Exception as e:
+                print(f"Ошибка при завершении WandB run: {e}")
+        if vdisplay:
+            try:
+                vdisplay.stop()
+                print("Виртуальный дисплей остановлен.")
+            except Exception as e:
+                print(f"Ошибка при остановке vdisplay: {e}")
+
+    print("\nСкрипт завершен.")
