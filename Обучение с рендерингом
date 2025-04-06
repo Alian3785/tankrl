@@ -1,0 +1,567 @@
+# -*- coding: utf-8 -*-
+import pygame
+import sys
+import math
+import random
+import numpy as np
+import os
+import time # Для контроля скорости рендеринга в Colab
+from typing import Optional, Union
+
+import gymnasium as gym
+from gymnasium import spaces
+
+# Импорты Stable Baselines3
+from stable_baselines3 import PPO
+# check_env может быть долгим, используем опционально
+# from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+
+# Импорты для рендеринга в Colab
+try:
+    from pyvirtualdisplay import Display
+    from PIL import Image
+    from IPython import display as ipythondisplay
+    colab_render_enabled = True
+except ImportError:
+    print("Не удалось импортировать библиотеки для рендеринга в Colab (pyvirtualdisplay, Pillow, IPython). Визуализация будет недоступна.")
+    colab_render_enabled = False
+
+
+# --- Константы Игры ---
+SCREEN_WIDTH = 400 # Уменьшим размер для Colab рендеринга
+SCREEN_HEIGHT = 300
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+GREEN = (0, 255, 0)
+RED = (255, 0, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+
+TANK_WIDTH = 20 # Уменьшим танки
+TANK_HEIGHT = 25
+TANK_SPEED = 4
+ENEMY_SPEED = 2.5
+PROJECTILE_SPEED = TANK_SPEED * 2
+PROJECTILE_RADIUS = 3
+
+FPS = 30 # Уменьшим FPS для рендеринга
+
+ENEMY_CHANGE_DIR_INTERVAL_STEPS = 50 # Интервалы в шагах среды
+ENEMY_SHOOT_INTERVAL_STEPS = 120
+
+MAX_PLAYER_PROJECTILES = 8
+MAX_ENEMY_PROJECTILES = 10
+MAX_ENEMIES = 3
+
+# --- Игровые Классы (Без изменений логики, но используют новые константы) ---
+
+class BaseTank(pygame.sprite.Sprite):
+    def __init__(self, x, y, color, speed, img_width=TANK_WIDTH, img_height=TANK_HEIGHT):
+        super().__init__()
+        self.img_width = img_width
+        self.img_height = img_height
+        # Используем pygame.SRCALPHA для возможной прозрачности
+        self.original_image = pygame.Surface([img_width, img_height], pygame.SRCALPHA)
+        # Рисуем более детально для наглядности
+        core_width = img_width * 0.8
+        core_height = img_height * 0.7
+        core_x = (img_width - core_width) / 2
+        core_y = img_height * 0.2
+        pygame.draw.rect(self.original_image, color, (core_x, core_y, core_width, core_height), border_radius=3) # Корпус
+        # Ствол
+        barrel_width = img_width * 0.15
+        barrel_height = img_height * 0.5
+        barrel_x = (img_width - barrel_width) / 2
+        barrel_y = 0
+        pygame.draw.rect(self.original_image, (100, 100, 100), (barrel_x, barrel_y, barrel_width, barrel_height)) # Ствол (вверх)
+
+        self.image = self.original_image
+        self.rect = self.image.get_rect(center=(x, y))
+        self.speed = speed
+        self.x = float(self.rect.centerx)
+        self.y = float(self.rect.centery)
+        self.direction_vector = pygame.math.Vector2(0, -1)
+        self.angle = 0
+        self.rotate()
+
+    def update(self, move_vector: Optional[pygame.math.Vector2] = None):
+        if not self.alive(): return
+        if move_vector and move_vector.length_squared() > 0:
+             norm_move_vec = move_vector.normalize()
+             if norm_move_vec != self.direction_vector:
+                 self.direction_vector = norm_move_vec
+                 self.rotate()
+             # Движение происходит всегда, когда есть вектор (враг) или когда вектор не нулевой (игрок)
+             self.x += self.direction_vector.x * self.speed
+             self.y += self.direction_vector.y * self.speed
+             self.apply_bounds()
+             self.rect.center = (int(self.x), int(self.y))
+
+    def rotate(self):
+        self.angle = math.degrees(math.atan2(-self.direction_vector.y, self.direction_vector.x)) - 90
+        old_center = self.rect.center
+        self.image = pygame.transform.rotate(self.original_image, self.angle)
+        self.rect = self.image.get_rect(center=old_center)
+
+    def apply_bounds(self):
+        half_w = self.rect.width / 2
+        half_h = self.rect.height / 2
+        self.x = max(half_w, min(self.x, SCREEN_WIDTH - half_w))
+        self.y = max(half_h, min(self.y, SCREEN_HEIGHT - half_h))
+
+    def shoot(self, projectile_color):
+        offset_distance = self.img_height / 2
+        spawn_pos = pygame.math.Vector2(self.rect.center) + self.direction_vector * offset_distance
+        return Projectile(spawn_pos.x, spawn_pos.y, self.direction_vector.copy(), projectile_color)
+
+class PlayerTank(BaseTank):
+    def __init__(self, x, y):
+        super().__init__(x, y, GREEN, TANK_SPEED)
+
+    def update(self, action: int): # action: 0:up, 1:down, 2:left, 3:right, 4:shoot, 5: no-op
+        if not self.alive(): return False
+        move_vector = pygame.math.Vector2(0, 0)
+        shooting = False
+        if action == 0: move_vector.y = -1
+        elif action == 1: move_vector.y = 1
+        elif action == 2: move_vector.x = -1
+        elif action == 3: move_vector.x = 1
+        elif action == 4: shooting = True
+        # action 5 (no-op) - вектор остается (0,0)
+        super().update(move_vector=move_vector) # Вызываем update базового класса
+        return shooting
+
+class EnemyTank(BaseTank):
+    def __init__(self, x, y, change_dir_interval, shoot_interval):
+        super().__init__(x, y, BLUE, ENEMY_SPEED)
+        self.change_dir_interval = change_dir_interval
+        self.shoot_interval = shoot_interval
+        self.move_timer = random.randint(1, self.change_dir_interval)
+        self.shoot_timer = random.randint(1, self.shoot_interval)
+        self.wants_to_shoot = False
+
+    def update(self, *args): # Игнорирует action
+        if not self.alive(): return
+        self.move_timer -= 1
+        if self.move_timer <= 0:
+            self.direction_vector = random.choice([
+                pygame.math.Vector2(0, 1), pygame.math.Vector2(0, -1),
+                pygame.math.Vector2(1, 0), pygame.math.Vector2(-1, 0)
+            ])
+            # Важно: Враг должен повернуться, но update() сам позаботится о движении
+            self.rotate()
+            self.move_timer = self.change_dir_interval + random.randint(-self.change_dir_interval//4, self.change_dir_interval//4)
+
+        # Враг всегда пытается двигаться в текущем направлении
+        super().update(move_vector=self.direction_vector)
+
+        self.shoot_timer -= 1
+        self.wants_to_shoot = False
+        if self.shoot_timer <= 0:
+            self.wants_to_shoot = True
+            self.shoot_timer = self.shoot_interval + random.randint(-self.shoot_interval//2, self.shoot_interval//2)
+
+class Projectile(pygame.sprite.Sprite):
+    def __init__(self, x, y, direction_vector, color):
+        super().__init__()
+        self.image = pygame.Surface([PROJECTILE_RADIUS * 2, PROJECTILE_RADIUS * 2], pygame.SRCALPHA)
+        pygame.draw.circle(self.image, color, (PROJECTILE_RADIUS, PROJECTILE_RADIUS), PROJECTILE_RADIUS)
+        self.rect = self.image.get_rect(center=(x, y))
+        self.speed = PROJECTILE_SPEED
+        if direction_vector.length_squared() > 0:
+             self.direction_vector = direction_vector.normalize()
+        else:
+             self.direction_vector = pygame.math.Vector2(0, -1)
+        self.x = float(self.rect.centerx)
+        self.y = float(self.rect.centery)
+
+    def update(self, *args):
+        move_vec = self.direction_vector * self.speed
+        self.x += move_vec.x
+        self.y += move_vec.y
+        self.rect.center = (int(self.x), int(self.y))
+        if (self.rect.bottom < 0 or self.rect.top > SCREEN_HEIGHT or
+                self.rect.right < 0 or self.rect.left > SCREEN_WIDTH):
+            self.kill()
+
+# --- Gymnasium Среда ---
+class TankEnv(gym.Env):
+    # Важно: Для Colab используем "rgb_array" по умолчанию для render()
+    metadata = {"render_modes": ["rgb_array", "human"], "render_fps": FPS}
+
+    def __init__(self, render_mode: Optional[str] = None):
+        super().__init__()
+
+        self.render_mode = render_mode
+        self.screen: Optional[pygame.Surface] = None
+        self.clock: Optional[pygame.time.Clock] = None
+        self.is_pygame_init = False
+
+        # Инициализация Pygame здесь, т.к. она нужна для создания спрайтов
+        self._ensure_pygame_init()
+
+        # Создание screen только при необходимости рендеринга
+        if self.render_mode == "human":
+            # В Colab 'human' не будет работать напрямую, но оставляем для локального запуска
+            try:
+                pygame.display.set_caption("Tank RL Environment")
+                self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                self.clock = pygame.time.Clock()
+            except pygame.error as e:
+                print(f"Не удалось создать окно Pygame (возможно, нет дисплея): {e}")
+                print("Переключение render_mode на None.")
+                self.render_mode = None # Отключаем рендеринг если нет дисплея
+                self.screen = None
+                self.clock = None
+
+        elif self.render_mode == "rgb_array":
+             # Создаем поверхность для рендеринга в массив
+             self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+
+        self.action_space = spaces.Discrete(6)
+        obs_size = 2 + MAX_ENEMIES * 3 + MAX_PLAYER_PROJECTILES * 2 + MAX_ENEMY_PROJECTILES * 2
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_size,), dtype=np.float32)
+
+        self.enemy_change_dir_interval = ENEMY_CHANGE_DIR_INTERVAL_STEPS
+        self.enemy_shoot_interval = ENEMY_SHOOT_INTERVAL_STEPS
+
+        # Состояние игры
+        self.player_tank: Optional[PlayerTank] = None
+        self.enemy_tanks = pygame.sprite.Group()
+        self.player_projectiles = pygame.sprite.Group()
+        self.enemy_projectiles = pygame.sprite.Group()
+        self.all_sprites = pygame.sprite.Group()
+        self.game_over = False
+        self.win = False
+        self._enemy_list = [] # Для сохранения порядка врагов в наблюдении
+
+    def _ensure_pygame_init(self):
+         if not self.is_pygame_init:
+              pygame.init()
+              pygame.font.init() # Инициализация шрифтов тоже
+              self.is_pygame_init = True
+
+    def _get_obs(self) -> np.ndarray:
+        # Заполнение массива наблюдений
+        obs = np.full(self.observation_space.shape, -1.0, dtype=np.float32)
+        # Игрок
+        if self.player_tank and self.player_tank.alive():
+            obs[0] = np.clip(self.player_tank.x / SCREEN_WIDTH * 2 - 1, -1.0, 1.0)
+            obs[1] = np.clip(self.player_tank.y / SCREEN_HEIGHT * 2 - 1, -1.0, 1.0)
+        # Враги
+        obs_idx = 2
+        for i in range(MAX_ENEMIES):
+            enemy_alive = False
+            if i < len(self._enemy_list) and self._enemy_list[i].alive():
+                enemy = self._enemy_list[i]
+                obs[obs_idx] = np.clip(enemy.x / SCREEN_WIDTH * 2 - 1, -1.0, 1.0)
+                obs[obs_idx + 1] = np.clip(enemy.y / SCREEN_HEIGHT * 2 - 1, -1.0, 1.0)
+                enemy_alive = True
+            obs[obs_idx + 2] = 1.0 if enemy_alive else 0.0
+            obs_idx += 3
+        # Снаряды игрока
+        proj_start_idx = obs_idx
+        for i, proj in enumerate(self.player_projectiles):
+            if i >= MAX_PLAYER_PROJECTILES: break
+            current_idx = proj_start_idx + i * 2
+            obs[current_idx] = np.clip(proj.x / SCREEN_WIDTH * 2 - 1, -1.0, 1.0)
+            obs[current_idx + 1] = np.clip(proj.y / SCREEN_HEIGHT * 2 - 1, -1.0, 1.0)
+        # Снаряды врагов
+        proj_start_idx = 2 + MAX_ENEMIES * 3 + MAX_PLAYER_PROJECTILES * 2
+        for i, proj in enumerate(self.enemy_projectiles):
+            if i >= MAX_ENEMY_PROJECTILES: break
+            current_idx = proj_start_idx + i * 2
+            obs[current_idx] = np.clip(proj.x / SCREEN_WIDTH * 2 - 1, -1.0, 1.0)
+            obs[current_idx + 1] = np.clip(proj.y / SCREEN_HEIGHT * 2 - 1, -1.0, 1.0)
+        return obs.astype(np.float32) # Убедимся что тип float32
+
+    def _get_info(self) -> dict:
+         player_alive = self.player_tank.alive() if self.player_tank else False
+         return {
+             "player_alive": player_alive,
+             "enemies_left": len(self.enemy_tanks),
+             "player_projectiles": len(self.player_projectiles),
+             "enemy_projectiles": len(self.enemy_projectiles),
+             "win": self.win
+         }
+
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> tuple[np.ndarray, dict]:
+        super().reset(seed=seed)
+        self.game_over = False
+        self.win = False
+        self.all_sprites.empty()
+        self.enemy_tanks.empty()
+        self.player_projectiles.empty()
+        self.enemy_projectiles.empty()
+        self._enemy_list = []
+
+        self.player_tank = PlayerTank(SCREEN_WIDTH // 2, SCREEN_HEIGHT - TANK_HEIGHT * 1.5)
+        self.all_sprites.add(self.player_tank)
+
+        for i in range(MAX_ENEMIES):
+            enemy_x = (i + 1) * SCREEN_WIDTH // (MAX_ENEMIES + 1)
+            enemy_y = TANK_HEIGHT
+            enemy = EnemyTank(enemy_x, enemy_y, self.enemy_change_dir_interval, self.enemy_shoot_interval)
+            self.all_sprites.add(enemy)
+            self.enemy_tanks.add(enemy)
+            self._enemy_list.append(enemy)
+
+        observation = self._get_obs()
+        info = self._get_info()
+        return observation, info
+
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
+        if self.game_over:
+            return self._get_obs(), 0.0, True, False, self._get_info()
+
+        reward = 0.0
+        terminated = False
+        truncated = False # Пока не используем
+
+        # 1. Обновление игрока
+        player_wants_to_shoot = False
+        player_alive_before_step = self.player_tank.alive()
+        if player_alive_before_step:
+            player_wants_to_shoot = self.player_tank.update(action)
+            if player_wants_to_shoot and len(self.player_projectiles) < MAX_PLAYER_PROJECTILES:
+                new_projectile = self.player_tank.shoot(RED)
+                self.all_sprites.add(new_projectile)
+                self.player_projectiles.add(new_projectile)
+                reward -= 0.02
+
+        # 2. Обновление врагов и их стрельба
+        for enemy in self.enemy_tanks:
+            enemy.update()
+            if enemy.wants_to_shoot and len(self.enemy_projectiles) < MAX_ENEMY_PROJECTILES:
+                new_projectile = enemy.shoot(YELLOW)
+                self.all_sprites.add(new_projectile)
+                self.enemy_projectiles.add(new_projectile)
+
+        # 3. Обновление снарядов
+        self.player_projectiles.update()
+        self.enemy_projectiles.update()
+
+        # 4. Проверка столкновений и награды/штрафы
+        enemies_hit = pygame.sprite.groupcollide(self.enemy_tanks, self.player_projectiles, True, True)
+        if enemies_hit:
+            reward += 15.0 * len(enemies_hit)
+            if len(self.enemy_tanks) == 0 and player_alive_before_step:
+                self.win = True
+                self.game_over = True
+                terminated = True
+                reward += 100.0
+
+        if player_alive_before_step and not self.game_over:
+             player_hits = pygame.sprite.spritecollide(self.player_tank, self.enemy_projectiles, True)
+             if player_hits:
+                 reward -= 50.0
+                 self.player_tank.kill()
+                 self.game_over = True
+                 terminated = True
+                 self.win = False
+
+        reward -= 0.01 # Штраф за шаг
+
+        observation = self._get_obs()
+        info = self._get_info()
+
+        # Важно: Рендеринг для 'human' вызывается здесь, только если он активен
+        if self.render_mode == "human":
+            self._render_frame()
+
+        return observation, reward, terminated, truncated, info
+
+    def render(self) -> Optional[np.ndarray]:
+        # render() теперь в основном для rgb_array
+        if self.render_mode == "rgb_array":
+            return self._render_frame()
+        # Для human рендеринг происходит в step
+        return None
+
+    def _render_frame(self) -> Optional[np.ndarray]:
+        if self.screen is None and self.render_mode is not None:
+             # Попытка создать экран, если он нужен для рендеринга, но не был создан
+             if self.render_mode == "human":
+                 try:
+                     self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+                 except pygame.error:
+                      self.render_mode = None # Не удалось создать, отключаем рендеринг
+                      return None
+             elif self.render_mode == "rgb_array":
+                  self.screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+        if self.screen is None: return None # Не можем рендерить без screen
+
+        # Отрисовка
+        self.screen.fill(BLACK)
+        self.all_sprites.draw(self.screen)
+
+        # Отображение сообщений (только если есть screen и режим human)
+        if self.render_mode == "human" and self.game_over:
+             try:
+                 font = pygame.font.Font(None, 48) # Стандартный шрифт
+                 message = "ПОБЕДА!" if self.win else "ПОРАЖЕНИЕ!"
+                 color = GREEN if self.win else RED
+                 text_surface = font.render(message, True, color)
+                 text_rect = text_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2))
+                 self.screen.blit(text_surface, text_rect)
+             except pygame.error as e:
+                 print(f"Ошибка рендеринга текста: {e}") # Может случиться если font модуль не инициализирован
+
+        if self.render_mode == "human":
+             if pygame.display.get_init():
+                 pygame.event.pump()
+                 pygame.display.flip()
+             if self.clock: self.clock.tick(self.metadata["render_fps"])
+             return None # Human режим не возвращает массив
+        elif self.render_mode == "rgb_array":
+             # Возвращаем массив пикселей
+             try:
+                return np.transpose(
+                    np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
+                ).astype(np.uint8) # Убедимся что тип uint8 для изображений
+             except pygame.error as e:
+                 print(f"Ошибка pygame.surfarray: {e}")
+                 return None # Возвращаем None в случае ошибки
+
+    def close(self):
+        # Закрываем pygame только если он был инициализирован
+        if self.is_pygame_init:
+            # Проверяем инициализацию модулей перед закрытием
+            if pygame.display.get_init():
+                 pygame.display.quit()
+            if pygame.font.get_init():
+                 pygame.font.quit()
+            pygame.quit()
+            self.is_pygame_init = False
+        self.screen = None # Сбрасываем screen
+
+# --- Обучение и Оценка в Colab ---
+if __name__ == '__main__':
+
+    vdisplay: Optional[Display] = None
+    if colab_render_enabled:
+        # --- Настройка виртуального дисплея для Colab ---
+        print("Настройка виртуального дисплея...")
+        try:
+            # Попробуем запросить больший буфер для xvfb, если доступно
+            vdisplay = Display(visible=0, size=(SCREEN_WIDTH, SCREEN_HEIGHT), backend="xvfb", extra_args=["-screen", "0", f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24"])
+        except Exception:
+             print("Не удалось использовать доп. аргументы для xvfb, используем стандартные.")
+             vdisplay = Display(visible=0, size=(SCREEN_WIDTH, SCREEN_HEIGHT))
+        vdisplay.start()
+        print("Виртуальный дисплей запущен.")
+    else:
+        print("Визуализация в Colab недоступна.")
+
+    log_dir = "logs/tank_ppo_colab/"
+    model_dir = "models/tank_ppo_colab/"
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    # --- Обучение (код обучения остается таким же) ---
+    print("\n--- Обучение ---")
+    train_base_env = TankEnv(render_mode=None)
+    monitor_path = os.path.join(log_dir, "monitor.csv")
+    train_monitored_env = Monitor(train_base_env, filename=monitor_path)
+    train_env = DummyVecEnv([lambda: train_monitored_env])
+    model = PPO("MlpPolicy", train_env, verbose=1, tensorboard_log=log_dir)
+    TOTAL_TIMESTEPS = 10000 # Оставляем для примера
+    MODEL_SAVE_NAME = f"ppo_tank_{TOTAL_TIMESTEPS}_steps"
+    print(f"Начинаем обучение на {TOTAL_TIMESTEPS} шагов...")
+    model.learn(total_timesteps=TOTAL_TIMESTEPS, reset_num_timesteps=True, tb_log_name="PPO_Colab")
+    print("Обучение завершено.")
+    model_path = os.path.join(model_dir, MODEL_SAVE_NAME)
+    model.save(model_path)
+    print(f"Модель сохранена в: {model_path}")
+    train_env.close()
+    print("Среда обучения закрыта.")
+
+    # --- Оценка ---
+    print("\n--- Оценка обученной модели ---")
+    eval_env = TankEnv(render_mode="rgb_array") # Всегда rgb_array для Colab рендеринга
+
+    # Переменная для хранения display handle изображения
+    img_display_handle = None
+
+    try:
+        loaded_model = PPO.load(model_path, env=eval_env)
+        episodes = 2
+        max_steps_per_episode = 500
+
+        for ep in range(episodes):
+            obs, info = eval_env.reset()
+            terminated = False
+            truncated = False
+            ep_reward = 0
+            ep_steps = 0
+            img_display_handle = None # Сбрасываем handle для нового эпизода
+
+            print(f"\nНачало эпизода оценки {ep+1}")
+            while not terminated and not truncated:
+                action, _states = loaded_model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                ep_reward += reward
+                ep_steps += 1
+
+                # --- ИЗМЕНЕННЫЙ РЕНДЕРИНГ КАДРА в Colab ---
+                if colab_render_enabled:
+                    try:
+                        frame = eval_env.render()
+                        if frame is not None:
+                            pil_image = Image.fromarray(frame)
+                            if img_display_handle is None:
+                                # Отображаем ПЕРВЫЙ кадр и получаем handle
+                                img_display_handle = ipythondisplay.display(pil_image, display_id=f"tank-img-{ep}-{time.time()}") # Уникальный ID
+                            else:
+                                # Обновляем существующий объект отображения
+                                img_display_handle.update(pil_image)
+
+                            # Контроль скорости можно оставить здесь или убрать для макс. скорости
+                            time.sleep(max(0, 1.0 / FPS - 0.01)) # Небольшая коррекция на время рендеринга/обновления
+
+                        else:
+                             # Если рендер вернул None, возможно, стоит прекратить попытки обновления
+                             if img_display_handle:
+                                 # Можно попытаться очистить последнее отображение, если рендер сломался
+                                 # ipythondisplay.clear_output(wait=True) # Или просто перестать обновлять
+                                 print("Предупреждение: render() вернул None, обновление остановлено.")
+                                 img_display_handle = None # Прекращаем попытки обновления
+                    except Exception as e:
+                        print(f"Ошибка во время рендеринга/отображения в Colab: {e}")
+                        # Возможно, стоит отключить рендеринг до конца оценки
+                        # colab_render_enabled = False
+
+                if ep_steps >= max_steps_per_episode:
+                    truncated = True
+
+            # Очистка последнего кадра после завершения эпизода (опционально)
+            # if colab_render_enabled:
+            #    ipythondisplay.clear_output(wait=True)
+
+            result_str = 'Усечено'
+            if info.get('win', False): result_str = 'Победа'
+            elif terminated: result_str = 'Поражение'
+            print(f"Конец эпизода оценки {ep+1}: Шагов={ep_steps}, Награда={ep_reward:.2f}, Результат: {result_str}")
+            if colab_render_enabled: time.sleep(0.5) # Небольшая пауза между эпизодами
+
+    except FileNotFoundError:
+        print(f"Ошибка: Не удалось загрузить модель из {model_path}.")
+    except Exception as e:
+        print(f"Произошла ошибка во время оценки: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        eval_env.close()
+        print("Среда оценки закрыта.")
+        if vdisplay:
+            try:
+                vdisplay.stop()
+                print("Виртуальный дисплей остановлен.")
+            except Exception as e:
+                print(f"Ошибка при остановке виртуального дисплея: {e}")
+
+    print("\nСкрипт завершен.")
